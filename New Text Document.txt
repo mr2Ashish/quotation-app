@@ -1,0 +1,677 @@
+import difflib
+import io
+import re
+import sqlite3
+import pandas as pd
+import pdfplumber
+import streamlit as st
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+# ==========================================
+# 1. DATABASE & PERSISTENCE LAYER (SQLite)
+# ==========================================
+DB_FILE = "quotation_master.db"
+
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS master_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            main_material TEXT NOT NULL,
+            sub_material TEXT NOT NULL UNIQUE,
+            purchase_price REAL DEFAULT 0.0,
+            discount REAL DEFAULT 0.0
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def load_master_data():
+    conn = get_db_connection()
+    df = pd.read_sql_query(
+        "SELECT id, main_material, sub_material, purchase_price, discount FROM master_items ORDER BY main_material, sub_material",
+        conn,
+    )
+    conn.close()
+    return df
+
+
+def save_master_data(df):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM master_items")
+    for _, row in df.iterrows():
+        main_mat = str(row.get("main_material", "")).strip()
+        sub_mat = str(row.get("sub_material", "")).strip()
+        if not sub_mat:
+            continue
+        try:
+            p_price = float(row.get("purchase_price", 0.0) or 0.0)
+        except (ValueError, TypeError):
+            p_price = 0.0
+        try:
+            disc = float(row.get("discount", 0.0) or 0.0)
+        except (ValueError, TypeError):
+            disc = 0.0
+
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO master_items (main_material, sub_material, purchase_price, discount)
+            VALUES (?, ?, ?, ?)
+        """,
+            (main_mat, sub_mat, p_price, disc),
+        )
+    conn.commit()
+    conn.close()
+
+
+def clear_master_db():
+    conn = get_db_connection()
+    conn.execute("DELETE FROM master_items")
+    conn.commit()
+    conn.close()
+
+
+# ==========================================
+# 2. FILE PARSING (EXCEL & PDF EXTRACTION)
+# ==========================================
+KNOWN_MAIN_CATEGORIES = [
+    "CABLE GLANDS - POWER WITH SUITABLE RUBBER HOOD",
+    "CABLE GLANDS -POWER WITH RUBBER HOOD",
+    "CABLE GLANDS - POWER",
+    "CABLE GLANDS - SIGNAL",
+    "CABLE GLAND - SIGNAL",
+    "CABLE GLANDS SIGNAL",
+    "REDUCER- ADAPTOR POWER",
+    "REDUCER-ADAPTOR POWER",
+    "REDUCER",
+    "BLINDS POWER & SIGNAL",
+    "BLIND - SIGNAL",
+    "BLINDSIGNAL",
+    "POWER CABLE LUGS & EARTHING LUGS (TINNED COPPER)",
+    "LUGS POWER + EARTHING (TINNED COPPER)",
+    "SIGNAL CABLE LUGS",
+    "LUGS SIGNALS",
+    "LUGS SIGNAL",
+    "SLEEVES",
+    "CABLE LABELS",
+    "CABLE LABLES",
+    "FERRULES",
+    "CABLE TIE",
+    "MISCELLANEOUS",
+    "MISCELENIOUS",
+]
+
+
+def clean_text(val):
+    if val is None:
+        return ""
+    return re.sub(r"\s+", " ", str(val)).strip()
+
+
+def parse_master_from_excel(file_bytes):
+    extracted_data = []
+    wb = pd.read_excel(file_bytes, sheet_name=None, header=None)
+
+    for sheet_name, df in wb.items():
+        current_main = "GENERAL"
+        for _, row in df.iterrows():
+            row_vals = [clean_text(v) for v in row if clean_text(v)]
+            if not row_vals:
+                continue
+
+            first_col = row_vals[0]
+            upper_first = first_col.upper()
+
+            # Check if this row is a Main Category header
+            is_main = any(cat in upper_first for cat in KNOWN_MAIN_CATEGORIES)
+            if is_main and len(row_vals) <= 2:
+                current_main = first_col
+                continue
+
+            # Check if row represents a sub-material item
+            desc = ""
+            if (
+                len(row_vals) >= 2
+                and row_vals[0].isdigit()
+                or (len(row_vals[0]) <= 3 and "." in row_vals[0])
+            ):
+                desc = row_vals[1]
+            else:
+                desc = row_vals[0]
+
+            # Filter out table column headers and numerical clutter
+            if (
+                desc.lower() in ["description", "item", "sr.no", "particulars"]
+                or desc.isdigit()
+            ):
+                continue
+
+            if len(desc) > 3:
+                extracted_data.append(
+                    {
+                        "main_material": current_main,
+                        "sub_material": desc,
+                        "purchase_price": 0.0,
+                        "discount": 0.0,
+                    }
+                )
+
+    return pd.DataFrame(extracted_data)
+
+
+def parse_master_from_pdf(file_bytes):
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        current_main = "GENERAL"
+        for page in pdf.pages:
+            text = page.extract_text()
+            if not text:
+                continue
+            lines = text.split("\n")
+            for line in lines:
+                line_clean = clean_text(line)
+                if not line_clean:
+                    continue
+
+                upper_line = line_clean.upper()
+                is_main = any(cat in upper_line for cat in KNOWN_MAIN_CATEGORIES)
+                if is_main and len(line_clean) < 60:
+                    current_main = line_clean
+                    continue
+
+                # Strip serial number prefixes (e.g., "1 ", "1. ", "12)")
+                sub_mat = re.sub(r"^\d+[\.\)\s]+", "", line_clean).strip()
+                if (
+                    sub_mat
+                    and len(sub_mat) > 3
+                    and not sub_mat.lower().startswith("sr.no")
+                ):
+                    extracted_data.append(
+                        {
+                            "main_material": current_main,
+                            "sub_material": sub_mat,
+                            "purchase_price": 0.0,
+                            "discount": 0.0,
+                        }
+                    )
+
+    return pd.DataFrame(extracted_data)
+
+
+def parse_bom_file(uploaded_file):
+    items = []
+    fname = uploaded_file.name.lower()
+
+    if fname.endswith((".xlsx", ".xls")):
+        df = pd.read_excel(uploaded_file, header=None)
+        desc_col_idx = None
+        qty_col_idx = None
+
+        # Detect columns for Description and Quantity
+        for r_idx in range(min(15, len(df))):
+            row_str = [str(x).lower() for x in df.iloc[r_idx].values]
+            for c_idx, val in enumerate(row_str):
+                if any(k in val for k in ["description", "sub material", "item"]):
+                    desc_col_idx = c_idx
+                if any(
+                    k in val for k in ["qty", "qwt", "quantity", "total qty"]
+                ):
+                    qty_col_idx = c_idx
+            if desc_col_idx is not None and qty_col_idx is not None:
+                df = df.iloc[r_idx + 1 :]
+                break
+
+        if desc_col_idx is None:
+            desc_col_idx = 1 if len(df.columns) > 1 else 0
+        if qty_col_idx is None:
+            qty_col_idx = 2 if len(df.columns) > 2 else desc_col_idx
+
+        for _, row in df.iterrows():
+            desc = clean_text(row.iloc[desc_col_idx])
+            qty_val = str(row.iloc[qty_col_idx])
+            qty_match = re.search(r"(\d+(\.\d+)?)", qty_val)
+            qty = float(qty_match.group(1)) if qty_match else 0.0
+
+            if desc and len(desc) > 2 and not desc.isdigit():
+                items.append({"bom_description": desc, "qty": qty})
+
+    elif fname.endswith(".pdf"):
+        with pdfplumber.open(io.BytesIO(uploaded_file.getvalue())) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for table in tables:
+                    for row in table:
+                        if not row or len(row) < 2:
+                            continue
+                        row_clean = [clean_text(c) for c in row if c]
+                        if len(row_clean) >= 2:
+                            desc = row_clean[1] if len(row_clean) > 2 else row_clean[0]
+                            qty_str = (
+                                row_clean[2]
+                                if len(row_clean) > 2
+                                else row_clean[-1]
+                            )
+                            qty_match = re.search(r"(\d+(\.\d+)?)", qty_str)
+                            qty = float(qty_match.group(1)) if qty_match else 0.0
+                            if desc and len(desc) > 2:
+                                items.append(
+                                    {"bom_description": desc, "qty": qty}
+                                )
+
+    return pd.DataFrame(items)
+
+
+# ==========================================
+# 3. EXCEL EXPORT ENGINE WITH LIVE FORMULAS
+# ==========================================
+def build_quotation_excel(quotation_df, profit_pct, overhead_val):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Quotation"
+
+    # Header parameters (K2 = Profit %, L2 = Overhead/Remark)
+    ws["J2"] = "Profit %:"
+    ws["J2"].font = Font(bold=True)
+    ws["K2"] = profit_pct / 100.0
+    ws["K2"].number_format = "0.00%"
+
+    ws["L2"] = "Overhead / Factor:"
+    ws["L2"].font = Font(bold=True)
+    ws["M2"] = overhead_val
+
+    headers = [
+        "Sr.No",
+        "Main Material",
+        "Sub Material Description",
+        "QTY",
+        "Purchase Price",
+        "Amnt",
+        "Discount %",
+        "Total Amnt",
+    ]
+
+    header_fill = PatternFill(
+        start_color="1F497D", end_color="1F497D", fill_type="solid"
+    )
+    header_font = Font(color="FFFFFF", bold=True)
+    border_style = Side(style="thin", color="D3D3D3")
+    cell_border = Border(
+        left=border_style, right=border_style, top=border_style, bottom=border_style
+    )
+
+    ws.append([])
+    ws.append([])  # Space for parameters in row 2
+    ws.append(headers)
+    header_row_idx = 4
+
+    for col_idx in range(1, len(headers) + 1):
+        c = ws.cell(row=header_row_idx, column=col_idx)
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    start_row = 5
+    for i, row in quotation_df.iterrows():
+        r = start_row + i
+        sr_no = i + 1
+        main_mat = row["main_material"]
+        sub_mat = row["sub_material"]
+        qty = row["qty"]
+        purchase_price = row["purchase_price"]
+        discount = row["discount"]
+
+        # Formulate exact Excel formulas:
+        # Amnt = Purchase Price * (1 + $K$2)
+        # Total Amnt = QTY * Amnt * (1 - Discount/100)
+        amnt_formula = f"=E{r}*(1+$K$2)"
+        total_amnt_formula = f"=D{r}*F{r}*(1-(G{r}/100))"
+
+        ws.append(
+            [
+                sr_no,
+                main_mat,
+                sub_mat,
+                qty,
+                purchase_price,
+                amnt_formula,
+                discount,
+                total_amnt_formula,
+            ]
+        )
+
+        # Apply cell formats
+        ws[f"A{r}"].alignment = Alignment(horizontal="center")
+        ws[f"D{r}"].number_format = "#,##0"
+        ws[f"E{r}"].number_format = "#,##0.00"
+        ws[f"F{r}"].number_format = "#,##0.00"
+        ws[f"G{r}"].number_format = "0.00"
+        ws[f"H{r}"].number_format = "#,##0.00"
+
+        for c_idx in range(1, 9):
+            ws.cell(row=r, column=c_idx).border = cell_border
+
+    # Total Row with dynamic SUM formula
+    end_row = start_row + len(quotation_df) - 1
+    total_row = end_row + 1
+
+    ws.cell(row=total_row, column=7, value="TOTAL:").font = Font(bold=True)
+    ws.cell(row=total_row, column=7).alignment = Alignment(horizontal="right")
+    total_cell = ws.cell(
+        row=total_row, column=8, value=f"=SUM(H{start_row}:H{end_row})"
+    )
+    total_cell.font = Font(bold=True)
+    total_cell.number_format = "#,##0.00"
+
+    # Auto-adjust column widths
+    for col in ws.columns:
+        col_letter = get_column_letter(col[0].column)
+        max_len = max(len(str(cell.value or "")) for cell in col)
+        ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+# ==========================================
+# 4. STREAMLIT APPLICATION INTERFACE
+# ==========================================
+st.set_page_config(
+    page_title="Panel Quotation & Master Manager", layout="wide"
+)
+st.title("Industrial Quotation Generator")
+
+# Initialize Session States
+if "quotation_records" not in st.session_state:
+    st.session_state.quotation_records = []
+if "unmatched_approvals" not in st.session_state:
+    st.session_state.unmatched_approvals = {}
+
+tabs = st.tabs(
+    ["1. Quotation Section", "2. Master Sheet Section", "3. File Upload Section"]
+)
+
+# ------------------------------------------
+# TAB 1: QUOTATION GENERATION & EXPORT
+# ------------------------------------------
+with tabs[0]:
+    st.subheader("Generate Quotation from BOM Files")
+
+    col_cfg1, col_cfg2, col_cfg3 = st.columns([2, 2, 2])
+    with col_cfg1:
+        profit_input = st.number_input(
+            "Profit % (Cell K2)",
+            min_value=0.0,
+            max_value=200.0,
+            value=15.0,
+            step=0.5,
+        )
+    with col_cfg2:
+        overhead_input = st.number_input(
+            "Overhead / Factor (Cell L2)", min_value=0.0, value=1.0, step=0.1
+        )
+    with col_cfg3:
+        if st.button("Delete / Clear Quotation Data", type="secondary"):
+            st.session_state.quotation_records = []
+            st.session_state.unmatched_approvals = {}
+            st.success("Quotation table wiped clean.")
+
+    uploaded_boms = st.file_uploader(
+        "Upload 1 or Multiple BOM Files (.xlsx, .xls, .pdf)",
+        type=["xlsx", "xls", "pdf"],
+        accept_multiple_files=True,
+    )
+
+    master_df = load_master_data()
+
+    if uploaded_boms:
+        if master_df.empty:
+            st.warning(
+                "Master Sheet is currently empty. Please add or upload materials in Section 2 or 3 first."
+            )
+        else:
+            all_bom_items = []
+            for bom_file in uploaded_boms:
+                parsed_bom = parse_bom_file(bom_file)
+                if not parsed_bom.empty:
+                    all_bom_items.append(parsed_bom)
+
+            if all_bom_items:
+                combined_bom = (
+                    pd.concat(all_bom_items, ignore_index=True)
+                    .groupby("bom_description", as_index=False)["qty"]
+                    .sum()
+                )
+
+                master_sub_list = master_df["sub_material"].tolist()
+                matched_rows = []
+                unmatched_items = []
+
+                for _, item in combined_bom.iterrows():
+                    bom_desc = item["bom_description"]
+                    qty = item["qty"]
+
+                    # Exact Match check (case-insensitive)
+                    exact = master_df[
+                        master_df["sub_material"].str.lower()
+                        == bom_desc.lower()
+                    ]
+                    if not exact.empty:
+                        m_row = exact.iloc[0]
+                        matched_rows.append(
+                            {
+                                "main_material": m_row["main_material"],
+                                "sub_material": m_row["sub_material"],
+                                "qty": qty,
+                                "purchase_price": m_row["purchase_price"],
+                                "discount": m_row["discount"],
+                            }
+                        )
+                    else:
+                        unmatched_items.append({"desc": bom_desc, "qty": qty})
+
+                # Handle Fuzzy Matching & Approvals
+                if unmatched_items:
+                    st.info(
+                        "Review Unmatched Items: Select or approve close matches found in the Master Sheet."
+                    )
+                    for idx, un_item in enumerate(unmatched_items):
+                        u_name = un_item["desc"]
+                        u_qty = un_item["qty"]
+
+                        # Find closest matches
+                        close_matches = difflib.get_close_matches(
+                            u_name, master_sub_list, n=3, cutoff=0.3
+                        )
+                        options = (
+                            ["-- Exclude / Reject --"]
+                            + close_matches
+                            + ["-- Keep as Custom New Item --"]
+                        )
+
+                        col_u1, col_u2 = st.columns([3, 2])
+                        with col_u1:
+                            st.write(
+                                f"**BOM Item:** `{u_name}` (Qty: {u_qty})"
+                            )
+                        with col_u2:
+                            choice = st.selectbox(
+                                f"Match candidate for #{idx+1}:",
+                                options,
+                                key=f"fuzzy_{idx}",
+                            )
+
+                        if (
+                            choice
+                            and choice != "-- Exclude / Reject --"
+                            and choice != "-- Keep as Custom New Item --"
+                        ):
+                            m_row = master_df[
+                                master_df["sub_material"] == choice
+                            ].iloc[0]
+                            matched_rows.append(
+                                {
+                                    "main_material": m_row["main_material"],
+                                    "sub_material": m_row["sub_material"],
+                                    "qty": u_qty,
+                                    "purchase_price": m_row["purchase_price"],
+                                    "discount": m_row["discount"],
+                                }
+                            )
+                        elif choice == "-- Keep as Custom New Item --":
+                            matched_rows.append(
+                                {
+                                    "main_material": "MISCELLANEOUS",
+                                    "sub_material": u_name,
+                                    "qty": u_qty,
+                                    "purchase_price": 0.0,
+                                    "discount": 0.0,
+                                }
+                            )
+
+                st.session_state.quotation_records = matched_rows
+
+    if st.session_state.quotation_records:
+        q_df = pd.DataFrame(st.session_state.quotation_records)
+
+        # Dynamic UI calculations matching the Excel logic
+        q_df["Amnt"] = q_df["purchase_price"] * (1 + (profit_input / 100.0))
+        q_df["Total Amnt"] = (
+            q_df["qty"] * q_df["Amnt"] * (1 - (q_df["discount"] / 100.0))
+        )
+
+        st.markdown("### Quotation Summary Table")
+        st.dataframe(
+            q_df[
+                [
+                    "main_material",
+                    "sub_material",
+                    "qty",
+                    "purchase_price",
+                    "Amnt",
+                    "discount",
+                    "Total Amnt",
+                ]
+            ].style.format(
+                {
+                    "qty": "{:,.0f}",
+                    "purchase_price": "₹{:,.2f}",
+                    "Amnt": "₹{:,.2f}",
+                    "discount": "{:.1f}%",
+                    "Total Amnt": "₹{:,.2f}",
+                }
+            ),
+            use_container_width=True,
+        )
+
+        grand_total = q_df["Total Amnt"].sum()
+        st.markdown(
+            f"### **Grand Total Amount: ₹ {grand_total:,.2f}** (Includes {profit_input}% profit)"
+        )
+
+        # Download Quotation as Excel with Live Formulas
+        excel_buffer = build_quotation_excel(
+            q_df, profit_input, overhead_input
+        )
+        st.download_button(
+            label="Download Complete Quotation (.xlsx)",
+            data=excel_buffer,
+            file_name="Quotation_Summary.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+# ------------------------------------------
+# TAB 2: MASTER SHEET (EDIT & PERSISTENCE)
+# ------------------------------------------
+with tabs[1]:
+    st.subheader("Master Sheet Management")
+    st.caption(
+        "Edits saved here remain persistent in the database across sessions and restarts."
+    )
+
+    current_master = load_master_data()
+
+    col_btn1, col_btn2 = st.columns([2, 4])
+    with col_btn1:
+        if st.button("Delete Entire Master Sheet", type="secondary"):
+            clear_master_db()
+            st.success("Master sheet completely wiped.")
+            st.rerun()
+
+    # Editable Data Table
+    edited_df = st.data_editor(
+        current_master,
+        num_rows="dynamic",
+        column_config={
+            "id": None,  # Hide primary key
+            "main_material": st.column_config.TextColumn(
+                "Main Material", required=True
+            ),
+            "sub_material": st.column_config.TextColumn(
+                "Sub Material", required=True
+            ),
+            "purchase_price": st.column_config.NumberColumn(
+                "Purchase Price", min_value=0.0, format="₹%.2f"
+            ),
+            "discount": st.column_config.NumberColumn(
+                "Discount %", min_value=0.0, max_value=100.0, format="%.1f%%"
+            ),
+        },
+        use_container_width=True,
+        key="master_editor",
+    )
+
+    if st.button("Save Master Sheet Changes", type="primary"):
+        save_master_data(edited_df)
+        st.success(f"Saved {len(edited_df)} items to the Master Sheet database.")
+        st.rerun()
+
+# ------------------------------------------
+# TAB 3: FILE UPLOAD (INITIAL POPULATION)
+# ------------------------------------------
+with tabs[2]:
+    st.subheader("Populate Master Sheet from Raw Files")
+    st.write(
+        "Upload reference quotation sheets or annexures (Excel/PDF). Bold main headings and underlying submaterials will be extracted."
+    )
+
+    ref_files = st.file_uploader(
+        "Upload Quotation / Annexure Files",
+        type=["xlsx", "xls", "pdf"],
+        accept_multiple_files=True,
+    )
+
+    if ref_files and st.button("Extract and Append to Master Sheet"):
+        total_extracted = []
+        for f in ref_files:
+            bytes_data = f.read()
+            if f.name.lower().endswith((".xlsx", ".xls")):
+                extracted = parse_master_from_excel(bytes_data)
+            else:
+                extracted = parse_master_from_pdf(bytes_data)
+            total_extracted.append(extracted)
+
+        if total_extracted:
+            combined_extracted = pd.concat(
+                total_extracted, ignore_index=True
+            ).drop_duplicates(subset=["sub_material"])
+            existing_db = load_master_data()
+
+            # Merge with existing master
+            final_df = (
+                pd.concat([existing_db, combined_extracted], ignore_index=True)
+                .drop_duplicates(subset=["sub_material"], keep="first")
+                .fillna(0.0)
+            )
+
+            save_master_data(final_df)
+            st.success(
+                f"Successfully extracted {len(combined_extracted)} unique submaterials and synchronized with Master Sheet!"
+            )
+            st.dataframe(combined_extracted.head(15), use_container_width=True)
